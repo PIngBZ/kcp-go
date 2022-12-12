@@ -1,4 +1,4 @@
-module github.com/PIngBZ/kcp-go
+module github.com/PIngBZ/kcp-go/v5
 
 require (
 	github.com/klauspost/cpuid v1.3.1 // indirect
