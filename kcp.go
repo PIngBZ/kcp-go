@@ -129,6 +129,12 @@ func (seg *segment) encode(ptr []byte) []byte {
 	return ptr
 }
 
+type KCPOptions struct {
+	InitialTXRTOBackoff       uint8
+	InitialTXRTOBackoffThresh int
+	EarlyRetransmit           bool
+}
+
 // KCP defines a single KCP connection
 type KCP struct {
 	conv, mtu, mss, state                  uint32
@@ -136,6 +142,7 @@ type KCP struct {
 	ssthresh                               uint32
 	rx_rttvar, rx_srtt                     int32
 	rx_rto, rx_minrto                      uint32
+	initial_tx_rto                         uint32
 	snd_wnd, rcv_wnd, rmt_wnd, cwnd, probe uint32
 	interval, ts_flush                     uint32
 	nodelay, updated                       uint32
@@ -154,7 +161,9 @@ type KCP struct {
 
 	buffer   []byte
 	reserved int
-	output   output_callback
+
+	options KCPOptions
+	output  output_callback
 }
 
 type ackItem struct {
@@ -167,7 +176,7 @@ type ackItem struct {
 // 'conv' must be equal in the connection peers, or else data will be silently rejected.
 //
 // 'output' function will be called whenever these is data to be sent on wire.
-func NewKCP(conv uint32, output output_callback) *KCP {
+func NewKCP(conv uint32, options KCPOptions, output output_callback) *KCP {
 	kcp := new(KCP)
 	kcp.conv = conv
 	kcp.snd_wnd = IKCP_WND_SND
@@ -182,6 +191,7 @@ func NewKCP(conv uint32, output output_callback) *KCP {
 	kcp.ts_flush = IKCP_INTERVAL
 	kcp.ssthresh = IKCP_THRESH_INIT
 	kcp.dead_link = IKCP_DEADLINK
+	kcp.options = options
 	kcp.output = output
 	return kcp
 }
@@ -393,6 +403,7 @@ func (kcp *KCP) update_ack(rtt int32) {
 	}
 	rto = uint32(kcp.rx_srtt) + _imax_(kcp.interval, uint32(kcp.rx_rttvar)<<2)
 	kcp.rx_rto = _ibound_(kcp.rx_minrto, rto, IKCP_RTO_MAX)
+	kcp.initial_tx_rto = _ibound_(kcp.rx_rto, rto+(rto>>kcp.options.InitialTXRTOBackoff), IKCP_RTO_MAX) // initial tx RTO backoff, it is vital to avoid unnecessary retransmit
 }
 
 func (kcp *KCP) shrink_buf() {
@@ -788,7 +799,14 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 	var change, lostSegs, fastRetransSegs, earlyRetransSegs uint64
 	minrto := int32(kcp.interval)
 
-	ref := kcp.snd_buf[:len(kcp.snd_buf)] // for bounds check elimination
+	sndBufLen := len(kcp.snd_buf)
+	initialTXRTO := kcp.rx_rto
+	if sndBufLen > kcp.options.InitialTXRTOBackoffThresh {
+		// Stream isn't thin
+		initialTXRTO = kcp.initial_tx_rto
+	}
+
+	ref := kcp.snd_buf[:sndBufLen] // for bounds check elimination
 	for k := range ref {
 		segment := &ref[k]
 		needsend := false
@@ -798,19 +816,19 @@ func (kcp *KCP) flush(ackOnly bool) uint32 {
 		if segment.xmit == 0 { // initial transmit
 			needsend = true
 			segment.rto = kcp.rx_rto
-			segment.resendts = current + segment.rto
+			segment.resendts = current + initialTXRTO
 		} else if segment.fastack >= resent { // fast retransmit
 			needsend = true
 			segment.fastack = 0
 			segment.rto = kcp.rx_rto
-			segment.resendts = current + segment.rto
+			segment.resendts = current + initialTXRTO
 			change++
 			fastRetransSegs++
-		} else if segment.fastack > 0 && newSegsCount == 0 { // early retransmit
+		} else if kcp.options.EarlyRetransmit && segment.fastack > 0 && newSegsCount == 0 { // early retransmit
 			needsend = true
 			segment.fastack = 0
 			segment.rto = kcp.rx_rto
-			segment.resendts = current + segment.rto
+			segment.resendts = current + initialTXRTO
 			change++
 			earlyRetransSegs++
 		} else if _itimediff(current, segment.resendts) >= 0 { // RTO
